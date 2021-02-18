@@ -11,7 +11,10 @@ gba = { git = "https://github.com/rust-console/gba.git" }
 vek = { version = "0.14", default-features = false, features = ["libm", "rgba"] }
 bresenham = "0.1"
 micromath = "1.1"
+#fixed = { version = "1.6", features = ["num-traits"] }
+fixed = { path = "../fixed", features = ["num-traits"] }
 linked_list_allocator = { version = "0.8", default-features = false, features = ["const_mut_refs"] }
+num-traits = { version = "0.2", default-features = false }
 
 [profile.dev]
 opt-level = 1

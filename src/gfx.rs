@@ -10,11 +10,7 @@ pub const SIZE: Extent2<usize> = Extent2::new(160, 128);
 
 const SCREEN: *mut u16 = 0x600_0000 as *mut u16;
 
-pub const VIEW: Vec2<isize> = Vec2::new(192, 160);
-
-pub fn init_mode3() {
-    unsafe { (0x400_0000 as *mut u16).write_volatile(0x0403); }
-}
+pub const VIEW: Vec2<isize> = Vec2::new(186, 130);
 
 // Only safe in debug mode
 #[inline(always)]
@@ -53,7 +49,7 @@ pub fn row_ptr(y: isize) -> *mut u16 {
 }
 
 fn to_scr(pos: Vec2<isize>) -> Vec2<isize> {
-    Vec2::from(SIZE.map(|e| e as isize)) / 2 + Vec2::new(pos.y, pos.x) * Vec2::new(3, 2) / 3
+    Vec2::from(SIZE.map(|e| e as isize)) / 2 + pos * Vec2::new(7, 8) / 8
 }
 
 pub fn line(a: Vec2<isize>, b: Vec2<isize>, col: u16) {
@@ -63,16 +59,17 @@ pub fn line(a: Vec2<isize>, b: Vec2<isize>, col: u16) {
 }
 
 pub fn tri(a: Vec2<isize>, b: Vec2<isize>, c: Vec2<isize>, mut col: u16) {
+    // Backface culling
     if c.determine_side(a, b) < 0 {
-        // return;
-        col = 0xF00F;
+        return;
+        // col = 0xF00F;
     }
 
     let a = to_scr(a);
     let b = to_scr(b);
     let c = to_scr(c);
 
-    let (a_, b_, c_) = (a, b, c);
+    // let (a_, b_, c_) = (a, b, c);
 
     let (a, b, c) = if a.y < b.y {
         if a.y < c.y {
@@ -94,19 +91,24 @@ pub fn tri(a: Vec2<isize>, b: Vec2<isize>, c: Vec2<isize>, mut col: u16) {
     let (mut x0, mut x1) = (a.x * FACTOR, a.x * FACTOR);
 
     let mut get_delta = |a: Vec2<isize>, b: Vec2<isize>| if a.y == b.y {
-        0
+        ((b.x - a.x) * FACTOR)
     } else {
         ((b.x - a.x) * FACTOR) / (b.y - a.y)
     };
 
-    let dxac = get_delta(a, c);
-    let dxab = get_delta(a, b);
-    let dxbc = get_delta(b, c);
+    let dxac = get_delta(a, c); debug_assert!((c.x - a.x).abs() * FACTOR >= dxac.abs());
+    let dxab = get_delta(a, b); debug_assert!((b.x - a.x).abs() * FACTOR >= dxab.abs());
+    let dxbc = get_delta(b, c); debug_assert!((c.x - b.x).abs() * FACTOR >= dxbc.abs());
     let (ldxa, rdxa, ldxb, rdxb) = if dxab > dxac { // rhs
         (dxac, dxab, dxac, dxbc)
     } else {
         (dxab, dxac, dxbc, dxac)
     };
+
+    #[repr(align(16))]
+    struct DmaData([u16; 2]);
+    static mut COL: DmaData= DmaData([0x0000; 2]);
+    unsafe { COL.0 = [col; 2]; }
 
     let draw_segment = |y0: isize, y1: isize, x0: &mut isize, x1: &mut isize, ldx, rdx| {
         *x0 += ldx * -y0.min(0);
@@ -117,10 +119,12 @@ pub fn tri(a: Vec2<isize>, b: Vec2<isize>, c: Vec2<isize>, mut col: u16) {
         let mut row = row_ptr(y0);
         for y in y0..y1 {
             let start = ((*x0).max(0) as usize >> FACTOR_L2) as isize;
-            let end = (((*x1).max(0) >> FACTOR_L2) + 1).min(SIZE.w as isize);
+            let end = ((*x1).max(0) >> FACTOR_L2).min(SIZE.w as isize);
+
+            debug_assert!(start <= end);
 
             let mut px = unsafe { row.offset(start) };
-            if end - start < 32 {
+            if end - start < 16 {
                 for x in start..end {
                     unsafe { px.write_volatile(col); };
                     px = unsafe { px.offset(1) };
@@ -128,10 +132,6 @@ pub fn tri(a: Vec2<isize>, b: Vec2<isize>, c: Vec2<isize>, mut col: u16) {
             } else {
                 use gba::io::dma::{DMAControlSetting, DMASrcAddressControl, DMADestAddressControl, DMAStartTiming, DMA0 as DMA};
                 unsafe {
-                    #[repr(align(16))]
-                    struct DmaData([u16; 2]);
-                    static mut COL: DmaData= DmaData([0x0000; 2]);
-                    COL.0 = [col; 2];
                     DMA::set_source(&COL as *const _ as *const _);
                     DMA::set_dest(row.offset(start) as *mut _ as *mut _);
                     DMA::set_count((end - start) as u16);
@@ -152,11 +152,16 @@ pub fn tri(a: Vec2<isize>, b: Vec2<isize>, c: Vec2<isize>, mut col: u16) {
     };
 
     draw_segment(a.y, b.y, &mut x0, &mut x1, ldxa, rdxa);
+    if dxab > dxac {
+        x1 = b.x * FACTOR;
+    } else {
+        x0 = b.x * FACTOR;
+    }
     draw_segment(b.y, c.y, &mut x0, &mut x1, ldxb, rdxb);
 
-    // put(a_, 0x00FF);
-    // put(b_, 0x0FF0);
-    // put(c_, 0xFF00);
+    // put(a_.map2(SIZE.into(), |e, sz: usize| e.clamped(0, sz as isize - 1)), 0x00FF);
+    // put(b_.map2(SIZE.into(), |e, sz: usize| e.clamped(0, sz as isize - 1)), 0x0FF0);
+    // put(c_.map2(SIZE.into(), |e, sz: usize| e.clamped(0, sz as isize - 1)), 0xFF00);
 
     // put(a + Vec2::new(2, 0), 0x00FF);
     // put(b + Vec2::new(2, 0), 0x0FF0);
