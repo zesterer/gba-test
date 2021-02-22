@@ -1,5 +1,16 @@
 #![no_std]
-#![feature(start, default_alloc_error_handler, array_map)]
+#![feature(
+    start,
+    default_alloc_error_handler,
+    array_map,
+    isa_attribute,
+    core_intrinsics,
+    bindings_after_at,
+)]
+
+mod gfx;
+mod heap;
+mod mem;
 
 use core::fmt::Write;
 use vek::*;
@@ -19,11 +30,11 @@ use gba::{
     vram::bitmap::{Mode3, Mode5},
     Color,
 };
+pub use mem::*;
 
-pub type F32 = fixed::types::I20F12;
+pub type F32 = fixed::types::I16F16;
 
-mod gfx;
-mod mem;
+pub fn fp(x: f32) -> F32 { F32::from_num(x) }
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
@@ -34,41 +45,36 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 #[start]
 fn main(_argc: isize, _argv: *const *const u8) -> isize {
-    mem::init();
-
-    const R: Rgba<f32> = Rgba::new(1.0, 0.0, 0.0, 1.0);
-    const Y: Rgba<f32> = Rgba::new(1.0, 1.0, 0.0, 1.0);
-    const G: Rgba<f32> = Rgba::new(0.0, 1.0, 0.0, 1.0);
-    const B: Rgba<f32> = Rgba::new(0.0, 0.0, 1.0, 1.0);
+    heap::init();
 
     let vertices = [
-        Vec3::new(-1.0, -1.0, -1.0).map(F32::from_num),
-        Vec3::new(-1.0, -1.0,  1.0).map(F32::from_num),
-        Vec3::new(-1.0,  1.0, -1.0).map(F32::from_num),
-        Vec3::new(-1.0,  1.0,  1.0).map(F32::from_num),
-        Vec3::new( 1.0, -1.0, -1.0).map(F32::from_num),
-        Vec3::new( 1.0, -1.0,  1.0).map(F32::from_num),
-        Vec3::new( 1.0,  1.0, -1.0).map(F32::from_num),
-        Vec3::new( 1.0,  1.0,  1.0).map(F32::from_num),
-    ];
+        Vec3::new(-1.0, -1.0, -1.0),
+        Vec3::new(-1.0, -1.0,  1.0),
+        Vec3::new(-1.0,  1.0, -1.0),
+        Vec3::new(-1.0,  1.0,  1.0),
+        Vec3::new( 1.0, -1.0, -1.0),
+        Vec3::new( 1.0, -1.0,  1.0),
+        Vec3::new( 1.0,  1.0, -1.0),
+        Vec3::new( 1.0,  1.0,  1.0),
+    ].map(|v| v.map(fp));
 
     const INDICES: &[usize] = &[
-        0, 3, 2, 0, 1, 3, // -x
-        7, 4, 6, 5, 4, 7, // +x
-        5, 0, 4, 1, 0, 5, // -y
-        2, 7, 6, 2, 3, 7, // +y
-        0, 6, 4, 0, 2, 6, // -z
-        7, 1, 5, 3, 1, 7, // +z
+        0, 2, 3, 0, 3, 1, // -x
+        4, 7, 6, 4, 5, 7, // +x
+        0, 5, 4, 0, 1, 5, // -y
+        2, 6, 7, 2, 7, 3, // +y
+        0, 4, 6, 0, 6, 2, // -z
+        1, 7, 5, 1, 3, 7, // +z
     ];
 
     let norms = [
-        Vec3::new(-1.0, 0.0, 0.0).map(F32::from_num),
-        Vec3::new(1.0, 0.0, 0.0).map(F32::from_num),
-        Vec3::new(0.0, -1.0, 0.0).map(F32::from_num),
-        Vec3::new(0.0, 1.0, 0.0).map(F32::from_num),
-        Vec3::new(0.0, 0.0, -1.0).map(F32::from_num),
-        Vec3::new(0.0, 0.0, 1.0).map(F32::from_num),
-    ];
+        Vec3::new(-1.0, 0.0, 0.0),
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(0.0, -1.0, 0.0),
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(0.0, 0.0, -1.0),
+        Vec3::new(0.0, 0.0, 1.0),
+    ].map(|v| v.map(fp));
 
     gba::info!("Starting...");
 
@@ -83,13 +89,16 @@ fn main(_argc: isize, _argv: *const *const u8) -> isize {
         .with_tick_rate(TimerTickRate::CPU1024)
         .with_enabled(true));
 
-    let mut ori = Quaternion::<f32>::identity();
+    let mut ori = Quaternion::<f32>::from_xyzw(0.25, 0.5, 0.25, 0.25).normalized();
 
-    let light_dir = Vec3::new(1.0, -1.0, -1.0).normalized().map(F32::from_num);
+    let light_dir = Vec3::new(1.0, -1.0, -1.0).normalized().map(fp);
 
     let mut tick = 0;
     let mut last_time = 0;
     let mut fps = 0.0;
+
+    let mut screen = unsafe { gfx::mode5::init() };
+
     loop {
         let new_time = TM0CNT_L.read();
         if tick % 32 == 0 {
@@ -101,52 +110,23 @@ fn main(_argc: isize, _argv: *const *const u8) -> isize {
         fps += (16_780_000.0 / (new_time - last_time) as f32) / 1024.0;
         last_time = new_time;
 
-        unsafe {
-            let bg2 = 0x4000000 as *mut u16;
-            // Swap axes and fill
-            // bg2.offset(0x10).write_volatile(0);
-            // bg2.offset(0x11).write_volatile(259);
-            // bg2.offset(0x12).write_volatile(137);
-            // bg2.offset(0x13).write_volatile(0);
-
-            // Stretch fill
-            bg2.offset(0x10).write_volatile(171);
-            bg2.offset(0x13).write_volatile(207);
-        };
-
         // Wait for vblank
-        IE.write(IrqFlags::new().with_hblank(true).with_vblank(true));
-        bios::vblank_interrupt_wait();
-        IE.write(IrqFlags::new().with_hblank(true).with_vblank(true));
+        IE.write(IrqFlags::new().with_vblank(true));
+        // bios::vblank_interrupt_wait();
 
-        // Set up display
-        DISPCNT.write(DisplayControlSetting::new()
-            .with_mode(DisplayMode::Mode5)
-            .with_frame1(!gfx::flip())
-            .with_bg2(true));
+        screen.flip();
 
-        // Clear back buffer
-        use gba::io::dma::{DMAControlSetting, DMASrcAddressControl, DMADestAddressControl, DMAStartTiming, DMA2 as DMA};
-        unsafe {
-            #[repr(align(16))]
-            struct DmaData([u16; 2]);
-            static mut COL: DmaData = DmaData([0; 2]);
-            COL.0 = [Color::from_rgb(70, 80, 120).0; 2];
-            DMA::set_source(&COL as *const _ as *const _);
-            DMA::set_dest(gfx::row_ptr_flip(0, false) as *mut _ as *mut _);
-            DMA::set_count((gfx::SIZE.product() / 2) as u16);
-            DMA::set_control(DMAControlSetting::new()
-                .with_source_address_control(DMASrcAddressControl::Fixed)
-                .with_dest_address_control(DMADestAddressControl::Increment)
-                .with_dma_repeat(false)
-                .with_use_32bit(true)
-                .with_start_time(DMAStartTiming::Immediate)
-                .with_enabled(true));
-        }
+        // use gba::vram::bitmap::Page;
+        // let page = if screen.fb_index() == 0 { Page::Zero } else { Page::One };
+        let mut fb = screen.back();
 
-        let angle_radians = tick as f32 / 30.0;
-        let c = micromath::F32Ext::cos(angle_radians);
-        let s = micromath::F32Ext::sin(angle_radians);
+        fb.clear(0x0000);
+        let col = if tick % 2 == 0 { 0 } else { 0xFFFF };
+        // for i in 0..1_000 {
+        //     unsafe { fb.line_unchecked(Vec2::new(16 + i & 31, 16), Vec2::new(24, 20 + (i + 16) & 31), col) };
+        //     // fb.line(Vec2::new(16 + i & 31, 16), Vec2::new(24, 20 + (i + 16) & 31), col);
+        //     // gba::vram::bitmap::Mode5::draw_line(page, 16 + i & 31, 16, 24, 20 + (i + 16) & 31, Color::from_rgb(col, col, col));
+        // }
 
         let keys = read_key_input();
 
@@ -169,20 +149,31 @@ fn main(_argc: isize, _argv: *const *const u8) -> isize {
                 Vec3::unit_y(),
             )
             * rotation_3d(
-                if keys.a() { 0.1 } else { 0.0 }
-                - if keys.b() { 0.1 } else { 0.0 },
+                if keys.b() { 0.1 } else { 0.0 }
+                - if keys.a() { 0.1 } else { 0.0 },
                 Vec3::unit_z(),
             )
         ).normalized();
 
-        let mvp = Mat3::from(ori).map(F32::from_num);
+        let mvp = Mat3::from(ori).map(fp);
 
-        let cube = |offset: Vec2<F32>| {
-            for (i, indices) in INDICES.chunks(3).enumerate() {
-                let norm = norms[i / 2];
+        // fb.convex(&[Vec2::new(5, 5), Vec2::new(20, 80), Vec2::new(30, 90), Vec2::new(50, 32)], 0xFF);
+
+        // for i in 0..15_0 {
+        //     let i = i % 122;
+        //     let offset = Vec2::new(i % 16, (i / 16) % 16) * 16;
+        //     fb.tri(&[Vec2::new(0, 0) + offset, Vec2::new(16, 16) + offset, Vec2::new(0, 16) + offset], 0xFFFF);
+        // }
+
+        let center = fb.size() / 2;
+
+        let mut cube = |offset: Vec2<F32>, scale: F32| {
+            // Quad
+            for (i, indices) in INDICES.chunks(6).enumerate() {
+                let norm = norms[i];
 
                 // Cheap backface culling using normal to skip unnecessary work
-                if mvp.cols.z.dot(norm) > F32::from_num(0.0) {
+                if mvp.cols.z.dot(norm) > fp(0.0) {
                     continue;
                 }
 
@@ -192,31 +183,35 @@ fn main(_argc: isize, _argv: *const *const u8) -> isize {
                     z: m.cols.z.dot(v),
                 };
 
-                let a = (mul(mvp, vertices[indices[0]]).xy() + offset) * F32::from_num(36);
-                let b = (mul(mvp, vertices[indices[1]]).xy() + offset) * F32::from_num(36);
-                let c = (mul(mvp, vertices[indices[2]]).xy() + offset) * F32::from_num(36);
-
                 let wnorm = mul(mvp, norm);
-                let light = wnorm.dot(light_dir).max(F32::from_num(0.25));
+                let light = wnorm.dot(light_dir).max(fp(0.25));
 
-                let rgb = norm.map(|e| ((e * F32::from_num(15.0) + F32::from_num(17.0)) * light).to_num::<u16>() % 32);
+                let rgb = norm.map(|e| ((e * fp(15.0) + fp(17.0)) * light).to_num::<u16>() % 32);
+                let rgb = Color::from_rgb(rgb.x, rgb.y, rgb.z).0;
 
-                gfx::tri(a.map(|e| e.to_num()), c.map(|e| e.to_num()), b.map(|e| e.to_num()), Color::from_rgb(rgb.x, rgb.y, rgb.z).0);
+                // Polygon
+                for indices in indices.chunks(3) {
+                    let mul_xy = |m: Mat3<_>, v: Vec3<_>| Vec2 {
+                        x: m.cols.x.dot(v),
+                        y: m.cols.y.dot(v),
+                    };
+
+                    let verts = [
+                        (mul_xy(mvp, vertices[indices[0]]) * scale * fp(36.0) + offset).map(|e| e.to_num()),
+                        (mul_xy(mvp, vertices[indices[1]]) * scale * fp(36.0) + offset).map(|e| e.to_num()),
+                        (mul_xy(mvp, vertices[indices[2]]) * scale * fp(36.0) + offset).map(|e| e.to_num()),
+                    ];
+
+                    fb.tri(&verts, rgb);
+                }
             }
         };
 
-        cube(Vec2::zero());
-        // cube(Vec2::unit_x() * F32::from_num(2.0));
-        // cube(-Vec2::unit_x() * F32::from_num(2.0));
-
-        // let sz = gfx::VIEW.map(|e| e as isize) / 2 - 1;
-        // gfx::line(Vec2::new(-sz.x, -sz.y), Vec2::new(sz.x, -sz.y), 0xFF);
-        // gfx::line(Vec2::new(-sz.x, sz.y), Vec2::new(sz.x, sz.y), 0xFF);
-        // gfx::line(Vec2::new(-sz.x, -sz.y), Vec2::new(-sz.x, sz.y), 0xFF);
-        // gfx::line(Vec2::new(sz.x, -sz.y), Vec2::new(sz.x, sz.y), 0xFF);
-
-        // gfx::line(Vec2::broadcast(4), Vec2::new(16, 4), Color::from_rgb(255, 0, 0).0);
-        // gfx::line(Vec2::broadcast(4), Vec2::new(4, 16), Color::from_rgb(0, 255, 0).0);
+        cube(center.map(F32::from_num), fp(1.0));
+        // cube((-Vec2::unit_x() - Vec2::unit_y()) * fp(32.0), fp(0.5));
+        // cube((Vec2::unit_x() - Vec2::unit_y()) * fp(32.0), fp(0.5));
+        // cube((-Vec2::unit_x() + Vec2::unit_y()) * fp(32.0), fp(0.5));
+        // cube((Vec2::unit_x() + Vec2::unit_y()) * fp(32.0), fp(0.5));
 
         tick += 1;
     }
@@ -243,76 +238,7 @@ extern "C" fn irq_handler(flags: IrqFlags) {
 }
 
 fn vblank_handler() { BIOS_IF.write(BIOS_IF.read().with_vblank(true)); }
-fn hblank_handler() {
-    let scanline = VCOUNT.read();
-
-    // unsafe {
-    //     use gba::io::dma::{DMAControlSetting, DMASrcAddressControl, DMADestAddressControl, DMAStartTiming, DMA0};
-    //     static CLEAR: [u16; 2] = [0xFFFF; 2];
-    //     DMA0::set_source(&CLEAR as *const _ as *const _);
-    //     DMA0::set_dest(gfx::row_ptr_flip(scanline.saturating_sub(1) as isize, false) as *mut _ as *mut _);
-    //     DMA0::set_count((gfx::SIZE.w / 2) as u16);
-    //     DMA0::set_control(DMAControlSetting::new()
-    //         .with_source_address_control(DMASrcAddressControl::Fixed)
-    //         .with_dest_address_control(DMADestAddressControl::Increment)
-    //         .with_dma_repeat(false)
-    //         .with_use_32bit(true)
-    //         .with_start_time(DMAStartTiming::Immediate)
-    //         .with_enabled(true));
-    // }
-
-    // static mut LAST: u16 = 0;
-    // for y in unsafe { LAST }..scanline {
-    //     let mut row = gfx::row_ptr_flip(y as isize, false);
-    //     for _ in 0..gfx::SIZE.w {
-    //         unsafe {
-    //             row.write_volatile(0);
-    //             row = row.offset(1);
-    //         }
-    //     }
-    // }
-
-    // unsafe {
-    //     LAST = if scanline == 0 { 0 } else { LAST.max(scanline).min(VBLANK_SCANLINE) };
-    // }
-
-    // if scanline <= VBLANK_SCANLINE {
-    //     let mut row = gfx::row_ptr_flip((scanline as isize).saturating_sub(1), true);
-    //     use gba::io::dma::{DMAControlSetting, DMASrcAddressControl, DMADestAddressControl, DMAStartTiming, DMA2 as DMA};
-    //     unsafe {
-    //         #[repr(align(16))]
-    //         struct DmaData([u16; 2]);
-    //         static mut COL: DmaData= DmaData([0x0000; 2]);
-    //         DMA::set_source(&COL as *const _ as *const _);
-    //         DMA::set_dest(row as *mut _ as *mut _);
-    //         DMA::set_count((gfx::SIZE.w / 2) as u16);
-    //         DMA::set_control(DMAControlSetting::new()
-    //             .with_source_address_control(DMASrcAddressControl::Fixed)
-    //             .with_dest_address_control(DMADestAddressControl::Increment)
-    //             .with_dma_repeat(false)
-    //             .with_use_32bit(true)
-    //             .with_start_time(DMAStartTiming::Immediate)
-    //             .with_enabled(true));
-    //     }
-    // }
-
-    // use gba::io::dma::{DMAControlSetting, DMASrcAddressControl, DMADestAddressControl, DMAStartTiming, DMA0};
-    // unsafe {
-    //     static CLEAR: [u16; 2] = [0xFF00; 2];
-    //     DMA0::set_source(&CLEAR as *const _ as *const _);
-    //     DMA0::set_dest(gfx::row_ptr_flip(scanline as isize, true) as *mut _ as *mut _);
-    //     DMA0::set_count((gfx::SIZE.w / 2) as u16);
-    //     DMA0::set_control(DMAControlSetting::new()
-    //         .with_source_address_control(DMASrcAddressControl::Fixed)
-    //         .with_dest_address_control(DMADestAddressControl::Increment)
-    //         .with_dma_repeat(true)
-    //         .with_use_32bit(true)
-    //         .with_start_time(DMAStartTiming::Immediate)
-    //         .with_enabled(true));
-    // }
-
-    BIOS_IF.write(BIOS_IF.read().with_hblank(true));
-}
+fn hblank_handler() { BIOS_IF.write(BIOS_IF.read().with_hblank(true)); }
 fn vcounter_handler() { BIOS_IF.write(BIOS_IF.read().with_vcounter(true)); }
 fn timer0_handler() { BIOS_IF.write(BIOS_IF.read().with_timer0(true)); }
 fn timer1_handler() { BIOS_IF.write(BIOS_IF.read().with_timer1(true)); }

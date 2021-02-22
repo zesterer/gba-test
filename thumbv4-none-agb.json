@@ -14,11 +14,11 @@
   "emit-debug-gdb-scripts": false,
   "env": "agb",
   "executables": true,
-  "features": "+soft-float,+strict-align,+no-branch-predictor",
+  "features": "+soft-float,+strict-align,+no-branch-predictor,+thumb-mode",
   "linker": "arm-none-eabi-ld",
   "linker-flavor": "ld",
   "linker-is-gnu": true,
-  "llvm-target": "thumbv4-none-agb",
+  "llvm-target": "arm7-none-agb",
   "os": "none",
   "panic-strategy": "abort",
   "pre-link-args-crt": {
