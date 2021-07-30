@@ -4,7 +4,8 @@ use core::{
 };
 use linked_list_allocator::Heap;
 
-static mut HEAP_BYTES: [u8; 16384] = [0; 16384];
+#[link_section = ".heap"]
+static mut HEAP_BYTES: [u8; 8192] = [0; 8192];
 
 static mut HEAP: Heap = Heap::empty();
 

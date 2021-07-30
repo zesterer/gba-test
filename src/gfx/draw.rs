@@ -1,14 +1,20 @@
 use super::*;
 use crate::mem::*;
 use vek::*;
-use core::intrinsics::{likely, unlikely};
+use core::intrinsics::{assume, likely, unlikely};
+
+pub trait Fill {}
+
+pub struct Flat(u16);
 
 impl Framebuffer {
+    #[link_section = ".text_fast"]
+    #[inline(never)]
     pub fn clear(&mut self, px: Px) {
         unsafe {
             write_u32_fast(
                 self.ptr() as *mut _,
-                self.size().product() as usize / 2,
+                self.size().product() / 2,
                 (px as u32) << 16 | px as u32,
                 true,
             );
@@ -27,14 +33,19 @@ impl Framebuffer {
         self.ptr_at(pos).write(px);
     }
 
+    #[link_section = ".text_fast"]
+    #[inline(never)]
     pub fn line(&mut self, a: Vec2<isize>, b: Vec2<isize>, px: Px) {
         unsafe { self.line_inner(a, b, px, true); }
     }
 
+    #[link_section = ".text_fast"]
+    #[inline(never)]
     pub unsafe fn line_unchecked(&mut self, a: Vec2<isize>, b: Vec2<isize>, px: Px) {
         self.line_inner(a, b, px, false);
     }
 
+    #[inline(always)]
     unsafe fn line_inner(&mut self, a: Vec2<isize>, b: Vec2<isize>, px: Px, checked: bool) {
         /// x is major axis, y is minor axis.
         #[inline(always)]
@@ -88,28 +99,20 @@ impl Framebuffer {
         }
     }
 
+    #[link_section = ".text_fast"]
+    #[inline(never)]
     pub fn tri(&mut self, verts @ [a, b, c]: &[Vec2<isize>; 3], px: Px) {
-        // Backface culling
-        if unlikely(c.determine_side(*a, *b) < 0) {
+        if c.determine_side(*a, *b) > 0 {
             return;
         }
 
-        return self.convex(verts, px);
+        // return self.convex_fast(verts, px);
 
         // Order vertices vertically, convert to fixed point (TODO: do this beforehand?)
         let [a, b, c] = if a.y < b.y {
             if a.y < c.y { if b.y < c.y { [a, b, c] } else { [a, c, b] } } else { [c, a, b] }
         } else {
             if b.y < c.y { if a.y < c.y { [b, a, c] } else { [b, c, a] } } else { [c, b, a] }
-        };
-
-
-        let get_delta = |a: &Vec2<isize>, b: &Vec2<isize>| if a.y == b.y {
-            (b.x - a.x) * ONE
-        } else {
-            // TODO: Fast fixed-range division using LUT
-            (b.x - a.x) * ONE / (b.y - a.y)
-            // unsafe { fast_div(b.x - a.x, b.y - a.y) }
         };
 
         // Find x deltas for each segment sides
@@ -167,6 +170,8 @@ impl Framebuffer {
         // self.line(*c, *a, 0);
     }
 
+    #[link_section = ".text_fast"]
+    #[inline(never)]
     pub fn convex<const N: usize>(&mut self, verts: &[Vec2<isize>; N], px: Px) {
         assert!(N >= 3, "Cannot rasterize convex polygon with fewer than 3 vertices");
 
@@ -186,19 +191,25 @@ impl Framebuffer {
             let edge_min = get_edge(bounds.min, i);
             edge_delta_x[i] = get_edge(bounds.min + Vec2::unit_x(), i) - edge_min;
             edge_delta_y[i] = get_edge(bounds.min + Vec2::unit_y() * ONE, i) - edge_min;
-            edge[i] = edge_min * ONE / edge_delta_x[i].abs().max(1);// + ONE / 2;
+            edge[i] = fixed_div_fast(edge_min, edge_delta_x[i].abs());
             edge_delta_y[i] /= edge_delta_x[i].abs().max(1);
         }
 
+        let mut top_vert = (0..N).min_by_key(|i| verts[*i].y).unwrap(); // Erased at compile-time
+
         let mut row = unsafe { self.ptr_at(Vec2::new(0, bounds.min.y as usize)) };
         for y in bounds.min.y..bounds.max.y {
-            let start = bounds.min.x + 1 + (0..N).fold(isize::MIN, |max, i| if edge_delta_x[i] > 0 { max.max(-edge[i]) } else { max }) / ONE;
-            let end = bounds.min.x + 1 + (0..N).fold(isize::MAX, |min, i| if edge_delta_x[i] < 0 { min.min(edge[i]) } else { min }) / ONE;
+            let start = bounds.min.x + 1 + ((0..N).fold(isize::MIN, |max, i| if edge_delta_x[i] < 0 { max.max(edge[i]) } else { max }) + ONE / 2) / ONE;
+            let end = bounds.min.x + 1 + ((0..N).fold(isize::MAX, |min, i| if edge_delta_x[i] >= 0 { min.min(-edge[i]) } else { min }) + ONE / 2) / ONE;
 
             let start = (start.max(0) as usize).min(self.size().x);
             let end = (end.max(0) as usize).max(start).min(self.size().x);
 
             unsafe { write_u16_fast(row.offset(start as isize), end - start, px, true); }
+
+            // for x in start..end {
+            //     unsafe { row.offset(x as isize).write(row.offset(x as isize).read() ^ 0xFFFF); }
+            // }
 
             row = unsafe { row.offset(self.size().x as isize) };
 
@@ -211,27 +222,125 @@ impl Framebuffer {
         //     self.line(verts[i], verts[(i + 1) % N], 0xFFFF);
         // }
     }
+
+    #[link_section = ".text_fast"]
+    #[inline(never)]
+    pub fn convex_fast<const N: usize>(&mut self, verts: &[Vec2<isize>; N], px: Px) {
+        assert!(N >= 3, "Cannot rasterize convex polygon with fewer than 3 vertices");
+
+        let top_vert = (0..N).min_by_key(|i| verts[*i].y).unwrap(); // Erased at compile-time
+        let bot_vert = (0..N).max_by_key(|i| verts[*i].y).unwrap(); // Erased at compile-time
+
+        let vert = |i| &verts[(i + N) % N];
+
+        let sz = self.size();
+
+        let mut trapezoid = |mut ax: isize, mut bx: isize, dax: isize, dbx: isize, ay: isize, by: isize| {
+            if unlikely(ay < 0) {
+                ax += dax * -ay.min(0);
+                bx += dbx * -ay.min(0);
+            }
+
+            let mut row = unsafe { self.ptr_at(Vec2::new(0, ay.max(0) as usize)) };
+            for y in ay.max(0)..by.min(self.size().y as isize) {
+
+                let mut start = ax / ONE;
+                let mut end = bx / ONE;
+
+                start = start.max(0).min(self.size().x as isize);
+                end = end.max(start).min(self.size().x as isize);
+
+                unsafe { write_u16_fast(row.offset(start), (end - start) as usize, px, true); }
+
+                // for x in start..end {
+                //     unsafe { row.offset(x as isize).write(row.offset(x as isize).read() ^ 0xFFFF); }
+                // }
+
+                row = unsafe { row.offset(self.size().x as isize) };
+
+                ax += dax;
+                bx += dbx;
+            }
+        };
+
+        let (mut l, mut r) = (top_vert, top_vert);
+        let mut ax = verts[top_vert].x * ONE;
+        let mut bx = ax;
+        let (mut dax, mut dbx) = (get_delta(vert(l), vert(l + 1)), get_delta(vert(r - 1), vert(r)));
+        let mut ay = verts[top_vert].y;
+        loop {
+            let by = vert(l + 1).y.min(vert(r - 1).y);
+
+            trapezoid(ax, bx, dax, dbx, ay, by);
+
+            ax += dax * (by - ay);
+            bx += dbx * (by - ay);
+
+            ay = if vert(l + 1).y < vert(r - 1).y {
+                l = (l + N + 1) % N;
+                if l == bot_vert {
+                    break;
+                }
+                ax = verts[l].x * ONE;
+                dax = get_delta(&verts[l], vert(l + 1));
+                vert(l).y
+            } else {
+                r = (r + N - 1) % N;
+                if r == bot_vert {
+                    break;
+                }
+                bx = verts[r].x * ONE;
+                dbx = get_delta(&verts[r], vert(r - 1));
+                vert(r).y
+            };
+        }
+
+        // Guide lines
+        // for i in 0..N {
+        //     self.line(verts[i], verts[(i + 1) % N], 0xFFFF);
+        // }
+    }
 }
 
 const FRAC: usize = 16;
 const ONE: isize = 1 << FRAC;
 
-// const RECIP_LEN: usize = 64;
-// const RECIP_LUT: [isize; RECIP_LEN] = make_recip_lut();
+fn get_delta(a: &Vec2<isize>, b: &Vec2<isize>) -> isize {
+    const LUT: [isize; 256] = {
+        let mut lut = [0; 256];
+        let mut i = 1;
+        while i < lut.len() {
+            lut[i] = ONE / i as isize;
+            i += 1;
+        }
+        lut
+    };
 
-// // Divisor must be between 1 and 256 (uninclusive)
-// pub unsafe fn fast_div(x: isize, y: isize) -> isize {
-//     RECIP_LUT.get_unchecked(y as usize) * x
-// }
+    if a.y == b.y {
+        (b.x - a.x) * ONE
+    } else {
+        fixed_div_fast(b.x - a.x, b.y - a.y)
+    }
+}
 
-// const fn make_recip_lut() -> [isize; RECIP_LEN] {
-//     let mut lut = [0; RECIP_LEN];
+#[inline(always)]
+fn fixed_div_fast(a: isize, b: isize) -> isize {
+    a * fixed_recip_fast(b)
+}
 
-//     let mut i = 1;
-//     while i < lut.len() {
-//         lut[i] = ONE / i as isize;
-//         i += 1;
-//     }
+#[link_section = ".text_fast"]
+#[inline(always)]
+#[no_mangle]
+extern fn fixed_recip_fast(x: isize) -> isize {
+    const LUT: [isize; 512] = {
+        let mut lut = [0; 512];
+        let mut i = 1;
+        while i < lut.len() {
+            lut[i] = ONE / if i == 256 { 1 } else { (i as isize - 256) };
+            i += 1;
+        }
+        lut
+    };
 
-//     lut
-// }
+    LUT[((x + 256) as usize).min(LUT.len() - 1)]
+}

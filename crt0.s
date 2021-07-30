@@ -59,6 +59,18 @@ __start:
     msr CPSR_c, r0
     ldr sp, =0x3007f00
 
+	@ @ copy .data.slow section to EWRAM
+    @ ldr r0, =__data_slow_lma     @ source address
+    @ ldr r1, =__data_slow_start   @ destination address
+    @ ldr r2, =__data_slow_end
+    @ subs r2, r1             @ length
+    @ @ these instructions are only executed if r2 is nonzero
+    @ @ (i.e. don't bother copying an empty .data.slow section)
+    @ addne r2, #3
+    @ asrne r2, #2
+    @ addne r2, #0x04000000
+    @ swine 0xb0000
+
     @ copy .data section to IWRAM
     ldr r0, =__data_lma     @ source address
     ldr r1, =__data_start   @ destination address

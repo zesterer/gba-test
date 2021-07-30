@@ -1,18 +1,26 @@
 #![no_std]
 #![feature(
+    test,
     start,
-    default_alloc_error_handler,
     array_map,
+    const_panic,
     isa_attribute,
     core_intrinsics,
+    maybe_uninit_ref,
     bindings_after_at,
+    stmt_expr_attributes,
+    default_alloc_error_handler,
+    const_fn_floating_point_arithmetic,
 )]
+
+extern crate alloc;
 
 mod gfx;
 mod heap;
 mod mem;
 
 use core::fmt::Write;
+use alloc::{vec::Vec, vec};
 use vek::*;
 use num_traits::float::Float;
 use gba::{
@@ -23,7 +31,7 @@ use gba::{
             DISPCNT, DISPSTAT, VCOUNT, VBLANK_SCANLINE,
         },
         background::{BackgroundControlSetting, BG2HOFS},
-        timers::{TimerControlSetting, TimerTickRate, TM0CNT_H, TM0CNT_L},
+        timers::{TimerControlSetting, TimerTickRate, TM2CNT_H, TM2CNT_L},
         keypad::read_key_input,
     },
     bios,
@@ -34,7 +42,73 @@ pub use mem::*;
 
 pub type F32 = fixed::types::I16F16;
 
-pub fn fp(x: f32) -> F32 { F32::from_num(x) }
+pub const fn num(x: f32) -> F32 {
+    use fixed::traits::Fixed;
+    F32::from_bits((x * (1 << F32::FRAC_NBITS) as f32) as <F32 as Fixed>::Bits)
+}
+
+fn normalize_quat_fast(q: Quaternion<F32>) -> Quaternion<F32> {
+    fn finvsqrt(x: f32) -> f32 {
+        let y = f32::from_bits(0x5f375a86 - (x.to_bits() >> 1));
+        y * (1.5 - ( x * 0.5 * y * y ))
+    }
+    fn fsqrt(x: f32) -> f32 {
+        f32::from_bits((x.to_bits() + (127 << 23)) >> 1)
+    }
+    let v = q.into_vec4();
+    (v * F32::from_num(finvsqrt(v.magnitude_squared().to_num::<f32>()))).into()
+}
+
+fn cos_fast(mut x: F32) -> F32 {
+    use core::f32;
+    x *= num(f32::consts::FRAC_1_PI / 2.0);
+    x -= num(0.25) + (x + num(0.25)).floor();
+    x *= num(16.0) * (x.abs() - num(0.5));
+    x += num(0.225) * x * (x.abs() - num(1.0));
+    x
+}
+
+fn sin_fast(x: F32) -> F32 {
+    use core::f32;
+    cos_fast(x - num(f32::consts::PI / 2.0))
+}
+
+fn tan_fast(x: F32) -> F32 {
+    sin_fast(x) / cos_fast(x)
+}
+
+fn rotation_3d(angle_radians: F32, axis: Vec3<F32>) -> Quaternion<F32> {
+    // let axis = axis.normalized();
+    let Vec3 { x, y, z } = axis * sin_fast(angle_radians * num(0.5));
+    let w = cos_fast(angle_radians * num(0.5));
+    Quaternion { x, y, z, w }
+}
+
+#[repr(transparent)]
+#[derive(Copy, Clone)]
+struct NumWrap(F32);
+
+impl core::ops::Mul<NumWrap> for NumWrap {
+    type Output = NumWrap;
+
+    fn mul(self, rhs: Self) -> Self { NumWrap(self.0 * rhs.0) }
+}
+
+impl vek::ops::MulAdd<NumWrap, NumWrap> for NumWrap {
+    type Output = NumWrap;
+
+    fn mul_add(self, mul: NumWrap, add: NumWrap) -> NumWrap {
+        NumWrap(self.0 * mul.0 + add.0)
+    }
+}
+
+fn apply(m: Mat3<F32>, n: Mat3<F32>) -> Mat3<F32> {
+    (m.map(NumWrap) * n.map(NumWrap)).map(|e| e.0)
+}
+
+fn apply4(m: Mat4<F32>, n: Mat4<F32>) -> Mat4<F32> {
+    (m.map(NumWrap) * n.map(NumWrap)).map(|e| e.0)
+}
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
@@ -47,35 +121,6 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 fn main(_argc: isize, _argv: *const *const u8) -> isize {
     heap::init();
 
-    let vertices = [
-        Vec3::new(-1.0, -1.0, -1.0),
-        Vec3::new(-1.0, -1.0,  1.0),
-        Vec3::new(-1.0,  1.0, -1.0),
-        Vec3::new(-1.0,  1.0,  1.0),
-        Vec3::new( 1.0, -1.0, -1.0),
-        Vec3::new( 1.0, -1.0,  1.0),
-        Vec3::new( 1.0,  1.0, -1.0),
-        Vec3::new( 1.0,  1.0,  1.0),
-    ].map(|v| v.map(fp));
-
-    const INDICES: &[usize] = &[
-        0, 2, 3, 0, 3, 1, // -x
-        4, 7, 6, 4, 5, 7, // +x
-        0, 5, 4, 0, 1, 5, // -y
-        2, 6, 7, 2, 7, 3, // +y
-        0, 4, 6, 0, 6, 2, // -z
-        1, 7, 5, 1, 3, 7, // +z
-    ];
-
-    let norms = [
-        Vec3::new(-1.0, 0.0, 0.0),
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec3::new(0.0, -1.0, 0.0),
-        Vec3::new(0.0, 1.0, 0.0),
-        Vec3::new(0.0, 0.0, -1.0),
-        Vec3::new(0.0, 0.0, 1.0),
-    ].map(|v| v.map(fp));
-
     gba::info!("Starting...");
 
     set_irq_handler(irq_handler);
@@ -85,30 +130,68 @@ fn main(_argc: isize, _argv: *const *const u8) -> isize {
         .with_hblank_irq_enable(true)
         .with_vblank_irq_enable(true));
 
-    TM0CNT_H.write(TimerControlSetting::new()
+    TM2CNT_H.write(TimerControlSetting::new()
         .with_tick_rate(TimerTickRate::CPU1024)
         .with_enabled(true));
 
-    let mut ori = Quaternion::<f32>::from_xyzw(0.25, 0.5, 0.25, 0.25).normalized();
+    let model = wavefront::Obj::from_lines(include_str!("../data/ship-small.obj").lines()).unwrap();
+    let mut ship_verts = Vec::new();
+    let mut ship_tris = Vec::new();
+    for &p in model.positions() {
+        ship_verts.push(Vec3::<f32>::from(p).map(num));
+    }
+    model
+        .triangles()
+        .for_each(|vs| {
+            let pos = vs.map(|v| Vec3::<f32>::from(v.position()));
+            let cross = (pos[1] - pos[0]).cross(pos[2] - pos[0]);
+            ship_tris.push((
+                (cross / micromath::F32Ext::sqrt(cross.magnitude_squared())).map(num),
+                vs.map(|v| v.position_index() as u16),
+            ));
+        });
 
-    let light_dir = Vec3::new(1.0, -1.0, -1.0).normalized().map(fp);
+    gba::info!("Model has {} vertices and {} triangles", ship_verts.len(), ship_tris.len());
+
+    let mut pos = Vec3::new(0.0, 0.0, 3.0).map(num);
+    let mut ori = normalize_quat_fast(Quaternion::<F32>::identity());
 
     let mut tick = 0;
     let mut last_time = 0;
-    let mut fps = 0.0;
+    let mut sum_fps = 0.0;
 
     let mut screen = unsafe { gfx::mode5::init() };
+    let mut scene = unsafe { gfx::scene::init() };
+
+    let mut time_mvp = 0;
+    let mut time_clear = 0;
+    let mut time_model = 0;
+    let mut time_vertices = 0;
+    let mut time_faces = 0;
+    let mut time_render = 0;
 
     loop {
-        let new_time = TM0CNT_L.read();
+        let new_time = TM2CNT_L.read();
         if tick % 32 == 0 {
             if new_time > last_time {
-                gba::info!("FPS: {}", fps / 32.0);
+                gba::info!("FPS: {}", sum_fps / 32.0);
+                gba::info!(
+                    "Timings: {{ mvp = {}, clear = {}, model = {}, vertices = {}, faces = {}, render = {} }}",
+                    time_mvp,
+                    time_clear,
+                    time_model,
+                    time_vertices,
+                    time_faces,
+                    time_render,
+                );
             }
-            fps = 0.0;
+            sum_fps = 0.0;
         }
-        fps += (16_780_000.0 / (new_time - last_time) as f32) / 1024.0;
+        let fps = (16_780_000.0 / (new_time - last_time) as f32) / 1024.0;
+        sum_fps += fps;
         last_time = new_time;
+
+        let dt = num(fps).recip();
 
         // Wait for vblank
         IE.write(IrqFlags::new().with_vblank(true));
@@ -116,107 +199,108 @@ fn main(_argc: isize, _argv: *const *const u8) -> isize {
 
         screen.flip();
 
-        // use gba::vram::bitmap::Page;
-        // let page = if screen.fb_index() == 0 { Page::Zero } else { Page::One };
-        let mut fb = screen.back();
-
-        fb.clear(0x0000);
-        let col = if tick % 2 == 0 { 0 } else { 0xFFFF };
-        // for i in 0..1_000 {
-        //     unsafe { fb.line_unchecked(Vec2::new(16 + i & 31, 16), Vec2::new(24, 20 + (i + 16) & 31), col) };
-        //     // fb.line(Vec2::new(16 + i & 31, 16), Vec2::new(24, 20 + (i + 16) & 31), col);
-        //     // gba::vram::bitmap::Mode5::draw_line(page, 16 + i & 31, 16, 24, 20 + (i + 16) & 31, Color::from_rgb(col, col, col));
-        // }
-
         let keys = read_key_input();
 
-        fn rotation_3d(angle_radians: f32, axis: Vec3<f32>) -> Quaternion<f32> {
-            let axis = axis.normalized();
-            let Vec3 { x, y, z } = axis * micromath::F32Ext::sin(angle_radians / 2.0);
-            let w = micromath::F32Ext::cos(angle_radians / 2.0);
-            Quaternion { x, y, z, w }
+        time_mvp = gba::time_this01! {{
+            ori = normalize_quat_fast(ori
+                * rotation_3d(
+                    if keys.down() { num(4.0) * dt } else { num(0.0) }
+                    - if keys.up() { num(4.0) * dt } else { num(0.0) },
+                    Vec3::unit_x(),
+                )
+                * rotation_3d(
+                    if keys.right() { num(4.0) * dt } else { num(0.0) }
+                    - if keys.left() { num(4.0) * dt } else { num(0.0) },
+                    Vec3::unit_y(),
+                )
+                * rotation_3d(
+                    if keys.r() { num(4.0) * dt } else { num(0.0) }
+                    - if keys.l() { num(4.0) * dt } else { num(0.0) },
+                    Vec3::unit_z(),
+                ));
+
+            pos += gfx::scene::transform_pos(Mat4::from(ori).transposed(), Vec3::unit_z() * (
+                if keys.a() { num(0.05) } else { num(0.0) }
+                    - if keys.b() { num(0.05) } else { num(0.0) }
+            )).xyz();
+        }};
+
+        let mut fb = screen.back();
+
+        time_clear = gba::time_this01! {{
+            fb.clear(Color::from_rgb(1, 3, 4).0);
+        }};
+
+        fn perspective_fov_rh_zo(fov_y_radians: F32, width: F32, height: F32, near: F32, far: F32) -> Mat4<F32> {
+            let rad = fov_y_radians;
+            let h = cos_fast(rad * num(0.5)) / sin_fast(rad * num(0.5));
+            let w = h * height / width;
+
+            let m00 = w;
+            let m11 = h;
+            let m22 = -(far + near) / (far - near);
+            let m23 = -(num(2.0) * far * near) / (far - near);
+            let m32 = -num(1.0);
+            let mut m = Mat4::new(
+                m00, num(0.0), num(0.0), num(0.0),
+                num(0.0), m11, num(0.0), num(0.0),
+                num(0.0), num(0.0), m22, m23,
+                num(0.0), num(0.0), m32, num(0.0)
+            );
+            m
         }
 
-        ori = (ori
-            * rotation_3d(
-                if keys.up() { 0.1 } else { 0.0 }
-                - if keys.down() { 0.1 } else { 0.0 },
-                Vec3::unit_x(),
-            )
-            * rotation_3d(
-                if keys.right() { 0.1 } else { 0.0 }
-                - if keys.left() { 0.1 } else { 0.0 },
-                Vec3::unit_y(),
-            )
-            * rotation_3d(
-                if keys.b() { 0.1 } else { 0.0 }
-                - if keys.a() { 0.1 } else { 0.0 },
-                Vec3::unit_z(),
-            )
-        ).normalized();
+        let proj = perspective_fov_rh_zo(num(1.0), num(fb.screen_size().x as f32), num(fb.screen_size().y as f32), num(0.5), num(256.0));
 
-        let mvp = Mat3::from(ori).map(fp);
+        let mut frame = scene.begin_frame(gfx::scene::SceneState {
+            proj,
+            view: Mat4::identity(),
+            light_dir: Vec3::new(0.0, -1.0, 0.0).normalized().map(num),
+            ambiance: num(0.2),
+            light_col: Rgb::new(1.0, 0.0, 0.5).map(num),
+        });
 
-        // fb.convex(&[Vec2::new(5, 5), Vec2::new(20, 80), Vec2::new(30, 90), Vec2::new(50, 32)], 0xFF);
+        let mut ship_model;
+        time_model = gba::time_this01! {{
+            ship_model = frame.add_model(apply4(Mat4::translation_3d(pos), Mat4::from(apply(Mat3::from(ori), Mat3::scaling_3d(num(0.2))))));
+        }};
 
-        // for i in 0..15_0 {
-        //     let i = i % 122;
-        //     let offset = Vec2::new(i % 16, (i / 16) % 16) * 16;
-        //     fb.tri(&[Vec2::new(0, 0) + offset, Vec2::new(16, 16) + offset, Vec2::new(0, 16) + offset], 0xFFFF);
-        // }
-
-        let center = fb.size() / 2;
-
-        let mut cube = |offset: Vec2<F32>, scale: F32| {
-            // Quad
-            for (i, indices) in INDICES.chunks(6).enumerate() {
-                let norm = norms[i];
-
-                // Cheap backface culling using normal to skip unnecessary work
-                if mvp.cols.z.dot(norm) > fp(0.0) {
-                    continue;
-                }
-
-                let mul = |m: Mat3<_>, v: Vec3<_>| Vec3 {
-                    x: m.cols.x.dot(v),
-                    y: m.cols.y.dot(v),
-                    z: m.cols.z.dot(v),
-                };
-
-                let wnorm = mul(mvp, norm);
-                let light = wnorm.dot(light_dir).max(fp(0.25));
-
-                let rgb = norm.map(|e| ((e * fp(15.0) + fp(17.0)) * light).to_num::<u16>() % 32);
-                let rgb = Color::from_rgb(rgb.x, rgb.y, rgb.z).0;
-
-                // Polygon
-                for indices in indices.chunks(3) {
-                    let mul_xy = |m: Mat3<_>, v: Vec3<_>| Vec2 {
-                        x: m.cols.x.dot(v),
-                        y: m.cols.y.dot(v),
-                    };
-
-                    let verts = [
-                        (mul_xy(mvp, vertices[indices[0]]) * scale * fp(36.0) + offset).map(|e| e.to_num()),
-                        (mul_xy(mvp, vertices[indices[1]]) * scale * fp(36.0) + offset).map(|e| e.to_num()),
-                        (mul_xy(mvp, vertices[indices[2]]) * scale * fp(36.0) + offset).map(|e| e.to_num()),
-                    ];
-
-                    fb.tri(&verts, rgb);
-                }
+        time_vertices = gba::time_this01! {{
+            for &v in &ship_verts {
+                frame.add_vert(ship_model, v);
             }
-        };
+        }};
 
-        cube(center.map(F32::from_num), fp(1.0));
-        // cube((-Vec2::unit_x() - Vec2::unit_y()) * fp(32.0), fp(0.5));
-        // cube((Vec2::unit_x() - Vec2::unit_y()) * fp(32.0), fp(0.5));
-        // cube((-Vec2::unit_x() + Vec2::unit_y()) * fp(32.0), fp(0.5));
-        // cube((Vec2::unit_x() + Vec2::unit_y()) * fp(32.0), fp(0.5));
+        time_faces = gba::time_this01! {{
+            for &(norm, indices) in &ship_tris {
+                let color = Rgb::new(1.0, 1.0, 1.0).map(num);
+
+                let verts = [
+                    indices[0],
+                    indices[1],
+                    indices[2],
+                ];
+                frame.add_convex(ship_model, (verts, color), norm);
+            }
+        }};
+
+        // frame.add_flat_quad(
+        //     0,
+        //     ([
+        //         Vec3::new(-0.3, -0.5, 0.0).map(num),
+        //         Vec3::new(0.0, 1.0, 0.0).map(num),
+        //         Vec3::new(0.8, 0.8, 0.0).map(num),
+        //         Vec3::new(1.0, 0.0, 0.0).map(num),
+        //     ], Rgb::broadcast(num(1.0))),
+        //     -Vec3::unit_z(),
+        // );
+
+        time_render = gba::time_this01! {{
+            frame.render(fb);
+        }};
 
         tick += 1;
     }
-
-    loop {}
 }
 
 extern "C" fn irq_handler(flags: IrqFlags) {
@@ -245,3 +329,12 @@ fn timer1_handler() { BIOS_IF.write(BIOS_IF.read().with_timer1(true)); }
 
 #[no_mangle]
 pub unsafe extern fn __truncdfsf2() {}
+
+// #[no_mangle]
+// pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+//     mem::copy_fast(
+//         core::slice::from_raw_parts(src, n),
+//         core::slice::from_raw_parts_mut(dst, n),
+//     );
+//     dst
+// }

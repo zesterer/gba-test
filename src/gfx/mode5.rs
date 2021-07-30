@@ -12,6 +12,8 @@ pub struct Framebuffer(UnsafeCell<[Px; FB_SIZE.x * FB_SIZE.y]>);
 impl Framebuffer {
     pub const fn size(&self) -> Vec2<usize> { FB_SIZE }
 
+    pub const fn screen_size(&self) -> Vec2<usize> { Vec2::new(240, 160) }
+
     #[inline(always)]
     pub fn raw(&mut self) -> &mut [Px; FB_SIZE.x * FB_SIZE.y] {
         self.0.get_mut()
@@ -45,8 +47,8 @@ impl Screen {
             // bg2.offset(0x13).write_volatile(0);
 
             // Stretch fill
-            // bg2.offset(0x10).write_volatile(171);
-            // bg2.offset(0x13).write_volatile(207);
+            bg2.offset(0x10).write_volatile(171);
+            bg2.offset(0x13).write_volatile(207);
         };
     }
 

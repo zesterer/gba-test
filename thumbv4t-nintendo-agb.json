@@ -14,11 +14,11 @@
   "emit-debug-gdb-scripts": false,
   "env": "agb",
   "executables": true,
-  "features": "+soft-float,+strict-align,+no-branch-predictor,+thumb-mode",
+  "features": "+soft-float,+strict-align,+no-branch-predictor,-thumb-mode",
   "linker": "arm-none-eabi-ld",
   "linker-flavor": "ld",
   "linker-is-gnu": true,
-  "llvm-target": "arm7-none-agb",
+  "llvm-target": "thumbv4t-nintendo-gba",
   "os": "none",
   "panic-strategy": "abort",
   "pre-link-args-crt": {
